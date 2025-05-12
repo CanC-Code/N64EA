@@ -1,0 +1,15 @@
+rom_name: ""          # To be filled with the ROM filename (without path)
+endian: "big"         # Fixed for N64
+arch: "mips"          # Fixed for N64
+header:               # N64 header information
+  pi_status: 0        # PI status register (offset 0x00, 4 bytes)
+  clock_rate: 0       # Clock rate (offset 0x04, 4 bytes)
+  entry_point: 0      # Program entry point (offset 0x08, 4 bytes)
+  release: 0          # Release offset (offset 0x0C, 4 bytes)
+  crc1: 0             # CRC1 checksum (offset 0x10, 4 bytes)
+  crc2: 0             # CRC2 checksum (offset 0x14, 4 bytes)
+  game_title: ""      # Game title (offset 0x20, 20 bytes, ASCII)
+  game_code: ""       # Game code (offset 0x3B, 4 bytes, ASCII)
+  version: 0          # Version (offset 0x3F, 1 byte)
+segments: []          # To be filled with detected segments [start, end, type]
+offsets: []           # To be filled with detected asset offsets (in hex)
