@@ -1,0 +1,8 @@
+N64EA
+Copyright (c) 2025 CanC-Code
+
+This project includes:
+- tkinter: Python License (included with Python)
+- pyyaml: MIT License (see LICENSE.pyyaml.txt)
+- n64splat: MIT License (see LICENSE.splat.txt)
+- n64img: MIT License (see LICENSE.n64img.txt)
