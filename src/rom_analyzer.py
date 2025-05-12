@@ -8,26 +8,38 @@ import os
 import logging
 import subprocess
 import shutil
-from concurrent.futures import ThreadPoolExecutor
-from n64img.image import CI4, CI8
-from datetime import datetime
-import psutil
+import json
 import time
 import gc
+import psutil
+from n64img.image import CI4, CI8
+from datetime import datetime
+from memory_profiler import profile
 
 # Configure logging with timestamps
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('n64ea.log'),
+        logging.StreamHandler()
+    ]
+)
 
 class RomAnalyzer:
     def __init__(self):
         self.rom_size = 0
         self.logger = logging.getLogger(__name__)
         self.logger.debug("Initialized RomAnalyzer")
+        self.temp_asset_file = "temp_assets.json"
+        self.peak_memory = 0
 
     def get_memory_usage(self):
         process = psutil.Process()
         mem_info = process.memory_info()
-        return mem_info.rss / 1024 / 1024  # MB
+        current = mem_info.rss / 1024 / 1024  # MB
+        self.peak_memory = max(self.peak_memory, current)
+        return current
 
     def get_cpu_usage(self):
         process = psutil.Process()
@@ -37,12 +49,13 @@ class RomAnalyzer:
         mem_usage = self.get_memory_usage()
         total_mem = psutil.virtual_memory().total / 1024 / 1024
         cpu_usage = self.get_cpu_usage()
-        if mem_usage / total_mem > 0.8 or cpu_usage > 90:
+        if mem_usage / total_mem > 0.7 or cpu_usage > 80:
             self.logger.warning(f"High resource usage: Memory={mem_usage:.2f}/{total_mem:.2f} MB, CPU={cpu_usage:.1f}%")
-            time.sleep(2)  # Throttle to reduce load
+            time.sleep(4)  # Increased throttle delay
             return False
         return True
 
+    @profile
     def load_rom(self, path):
         self.logger.debug(f"Entering load_rom: {path}")
         if not os.path.exists(path):
@@ -56,7 +69,7 @@ class RomAnalyzer:
                 self.logger.error(f"ROM too small: 0x{self.rom_size:08x} bytes")
                 raise ValueError(f"ROM too small: 0x{self.rom_size:08x} bytes")
             self.logger.info(f"ROM size: 0x{self.rom_size:08x} bytes")
-            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
             return rom
         except Exception as e:
             self.logger.error(f"Failed to load ROM: {str(e)}")
@@ -71,6 +84,7 @@ class RomAnalyzer:
         self.logger.debug("Exiting is_v64")
         return is_v64
 
+    @profile
     def to_big_endian(self, rom):
         self.logger.debug("Entering to_big_endian")
         try:
@@ -79,7 +93,7 @@ class RomAnalyzer:
                 out[i] = rom[i + 1]
                 out[i + 1] = rom[i]
             self.logger.info("Converted ROM to big-endian")
-            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
             return out
         except Exception as e:
             self.logger.error(f"Failed to convert ROM to big-endian: {str(e)}")
@@ -93,13 +107,16 @@ class RomAnalyzer:
             if offset + 16 > len(rom):
                 self.logger.error(f"Invalid MIO0 offset: 0x{offset:08x}")
                 return b''
-            if rom[offset:offset+4] != b'\x11\x72\x00\x00':
-                self.logger.error(f"No MIO0 header at 0x{offset:08x}")
+            if rom[offset:offset+4] != b'MIO0':
+                self.logger.debug(f"No MIO0 signature at 0x{offset:08x}")
                 return b''
             comp_size = struct.unpack('>I', rom[offset+8:offset+12])[0]
             uncomp_size = struct.unpack('>I', rom[offset+12:offset+16])[0]
-            if comp_size > len(rom) - offset or uncomp_size > 0x200000 or comp_size < 4:
-                self.logger.error(f"Invalid MIO0 sizes: comp=0x{comp_size:08x}, uncomp=0x{uncomp_size:08x}")
+            if (comp_size > len(rom) - offset or
+                uncomp_size > 0x100000 or
+                comp_size < 4 or
+                uncomp_size < comp_size):
+                self.logger.error(f"Invalid MIO0 sizes at 0x{offset:08x}: comp=0x{comp_size:08x}, uncomp=0x{uncomp_size:08x}")
                 return b''
             output = bytearray(uncomp_size)
             comp_data = rom[offset+16:offset+16+comp_size]
@@ -128,8 +145,8 @@ class RomAnalyzer:
                                 if out_pos - dist >= 0:
                                     output[out_pos] = output[out_pos - dist]
                                 out_pos += 1
-            if out_pos < uncomp_size // 2:
-                self.logger.error(f"MIO0 decompression failed: output too small (0x{out_pos:08x}/0x{uncomp_size:08x})")
+            if out_pos < uncomp_size // 10:
+                self.logger.error(f"MIO0 decompression failed at 0x{offset:08x}: output too small (0x{out_pos:08x}/0x{uncomp_size:08x})")
                 return b''
             self.logger.info(f"Decompressed MIO0 at 0x{offset:08x}, size=0x{out_pos:08x}")
             return bytes(output)
@@ -139,53 +156,94 @@ class RomAnalyzer:
         finally:
             self.logger.debug("Exiting decompress_mio0")
 
+    @profile
     def find_mio0_headers(self, rom, progress_callback=None):
         self.logger.debug("Entering find_mio0_headers")
         potential_count = 0
         invalid_count = 0
+        temp_assets = []
+        known_offsets = [0xF19250]  # Known Banjo-Kazooie MIO0 offset
         i = 0
         try:
+            # Check known offsets first
+            for offset in known_offsets:
+                if offset + 16 <= len(rom) and rom[offset:offset+4] == b'MIO0':
+                    comp_size = struct.unpack('>I', rom[offset+8:offset+12])[0]
+                    uncomp_size = struct.unpack('>I', rom[offset+12:offset+16])[0]
+                    if (4 <= comp_size <= len(rom) - offset and
+                        4 <= uncomp_size <= 0x100000 and
+                        uncomp_size >= comp_size):
+                        decomp_data = self.decompress_mio0(rom, offset, comp_size)
+                        if decomp_data:
+                            asset = {'offset': offset, 'length': comp_size, 'type': 'mio0', 'uncomp_size': uncomp_size}
+                            yield asset
+                            temp_assets.append(asset)
+                            self.logger.info(f"Valid MIO0 at offset 0x{offset:08x}")
+                            if len(temp_assets) >= 500:
+                                with open(self.temp_asset_file, 'a') as f:
+                                    json.dump(temp_assets, f)
+                                    f.write('\n')
+                                temp_assets = []
+                    else:
+                        invalid_count += 1
+                        if invalid_count < 5:
+                            self.logger.warning(f"Invalid MIO0 at known offset 0x{offset:08x}")
+            # Full scan
             while i < len(rom) - 16:
                 if not self.check_resources():
                     self.logger.warning("Throttling MIO0 scan due to high resource usage")
                 if progress_callback and i % 0x100000 == 0:
                     progress_callback(i / (len(rom) - 16) * 20, f"Scanning MIO0: {potential_count} potential")
-                idx = rom.find(b'\x11\x72\x00\x00', i)
+                idx = rom.find(b'MIO0', i)
                 if idx == -1 or idx + 16 > len(rom):
                     break
                 i = idx
                 comp_size = struct.unpack('>I', rom[i+8:i+12])[0]
                 uncomp_size = struct.unpack('>I', rom[i+12:i+16])[0]
-                if potential_count < 10:
-                    self.logger.info(f"Potential MIO0 at 0x{i:08x}, comp_size=0x{comp_size:08x}, uncomp_size=0x{uncomp_size:08x}")
                 potential_count += 1
-                if (4 <= comp_size <= 0x100000 and
-                    4 <= uncomp_size <= 0x200000 and
-                    uncomp_size >= comp_size and
-                    i + comp_size <= len(rom)):
+                if potential_count < 5:
+                    self.logger.info(f"Potential MIO0 at 0x{i:08x}, comp_size=0x{comp_size:08x}, uncomp_size=0x{uncomp_size:08x}")
+                if (4 <= comp_size <= len(rom) - i and
+                    4 <= uncomp_size <= 0x100000 and
+                    uncomp_size >= comp_size):
                     decomp_data = self.decompress_mio0(rom, i, comp_size)
                     if decomp_data:
-                        yield {'offset': i, 'length': comp_size, 'type': 'mio0', 'uncomp_size': uncomp_size}
+                        asset = {'offset': i, 'length': comp_size, 'type': 'mio0', 'uncomp_size': uncomp_size}
+                        yield asset
+                        temp_assets.append(asset)
                         self.logger.info(f"Valid MIO0 at offset 0x{i:08x}")
+                        if len(temp_assets) >= 500:
+                            with open(self.temp_asset_file, 'a') as f:
+                                json.dump(temp_assets, f)
+                                f.write('\n')
+                            temp_assets = []
                     else:
                         invalid_count += 1
                 else:
-                    if invalid_count < 10:
-                        self.logger.warning(f"Invalid MIO0 at 0x{i:08x}: comp_size or uncomp_size out of range")
                     invalid_count += 1
+                    if invalid_count < 5:
+                        self.logger.warning(f"Invalid MIO0 at 0x{i:08x}: comp_size or uncomp_size out of range")
                 i += 4
-            if invalid_count > 10:
-                self.logger.info(f"Skipped {invalid_count - 10} additional invalid MIO0 headers")
+            if temp_assets:
+                with open(self.temp_asset_file, 'a') as f:
+                    json.dump(temp_assets, f)
+                    f.write('\n')
+            if invalid_count > 5:
+                self.logger.info(f"Skipped {invalid_count - 5} additional invalid MIO0 headers")
         except Exception as e:
             self.logger.error(f"MIO0 scanning failed: {str(e)}")
-        self.logger.info(f"Scanned {potential_count} potential MIO0 headers, {invalid_count} invalid")
-        self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
-        self.logger.debug("Exiting find_mio0_headers")
+        finally:
+            self.logger.info(f"Scanned {potential_count} potential MIO0 headers, {invalid_count} invalid")
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
+            self.logger.debug("Exiting find_mio0_headers")
 
+    @profile
     def find_yaz0_headers(self, rom, progress_callback=None):
         self.logger.debug("Entering find_yaz0_headers")
         potential_count = 0
         invalid_count = 0
+        temp_assets = []
         i = 0
         try:
             while i < len(rom) - 16:
@@ -198,55 +256,100 @@ class RomAnalyzer:
                     break
                 i = idx
                 uncomp_size = struct.unpack('>I', rom[i+4:i+8])[0]
-                if potential_count < 10:
-                    self.logger.info(f"Potential Yaz0 at 0x{i:08x}, uncomp_size=0x{uncomp_size:08x}")
                 potential_count += 1
-                if 4 <= uncomp_size <= 0x200000:
-                    yield {'offset': i, 'length': 0, 'type': 'yaz0', 'uncomp_size': uncomp_size}
+                if potential_count < 5:
+                    self.logger.info(f"Potential Yaz0 at 0x{i:08x}, uncomp_size=0x{uncomp_size:08x}")
+                if 4 <= uncomp_size <= 0x100000:
+                    asset = {'offset': i, 'length': 0, 'type': 'yaz0', 'uncomp_size': uncomp_size}
+                    yield asset
+                    temp_assets.append(asset)
                     self.logger.info(f"Valid Yaz0 at offset 0x{i:08x}")
+                    if len(temp_assets) >= 500:
+                        with open(self.temp_asset_file, 'a') as f:
+                            json.dump(temp_assets, f)
+                            f.write('\n')
+                        temp_assets = []
                 else:
-                    if invalid_count < 10:
-                        self.logger.warning(f"Invalid Yaz0 at 0x{i:08x}: uncomp_size out of range")
                     invalid_count += 1
+                    if invalid_count < 5:
+                        self.logger.warning(f"Invalid Yaz0 at 0x{i:08x}: uncomp_size out of range")
                 i += 4
-            if invalid_count > 10:
-                self.logger.info(f"Skipped {invalid_count - 10} additional invalid Yaz0 headers")
+            if temp_assets:
+                with open(self.temp_asset_file, 'a') as f:
+                    json.dump(temp_assets, f)
+                    f.write('\n')
+            if invalid_count > 5:
+                self.logger.info(f"Skipped {invalid_count - 5} additional invalid Yaz0 headers")
         except Exception as e:
             self.logger.error(f"Yaz0 scanning failed: {str(e)}")
-        self.logger.info(f"Scanned {potential_count} potential Yaz0 headers, {invalid_count} invalid")
-        self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
-        self.logger.debug("Exiting find_yaz0_headers")
+        finally:
+            self.logger.info(f"Scanned {potential_count} potential Yaz0 headers, {invalid_count} invalid")
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
+            self.logger.debug("Exiting find_yaz0_headers")
 
+    @profile
     def find_textures(self, rom, progress_callback=None):
         self.logger.debug("Entering find_textures")
-        chunk_size = 0x80000  # 512KB chunks
+        chunk_size = 0x20000  # 128KB chunks
+        texture_count = 0
+        temp_assets = []
         try:
             for chunk_start in range(0, len(rom) - 0x1000, chunk_size):
                 if not self.check_resources():
                     self.logger.warning("Throttling texture scan due to high resource usage")
                 chunk_end = min(chunk_start + chunk_size, len(rom) - 0x1000)
                 i = chunk_start
-                texture_count = 0
                 while i < chunk_end:
                     if progress_callback and i % 0x100000 == 0:
                         progress_callback(40 + (i / (len(rom) - 0x1000) * 30), f"Scanning Textures: {texture_count} textures")
-                    for fmt, cls in [('ci4', CI4), ('ci8', CI8)]:
-                        try:
-                            img = cls(rom[i:i+0x1000], 32, 32)
-                            yield {'offset': i, 'length': img.size, 'type': f'texture_{fmt}', 'uncomp_size': img.size}
-                            self.logger.info(f"Found texture ({fmt}) at offset 0x{i:08x}, size 0x{img.size:08x}")
-                            i += img.size
+                    try:
+                        img = CI4(rom[i:i+0x1000], 32, 32)
+                        if 8 <= img.width <= 64 and 8 <= img.height <= 64:
+                            asset = {'offset': i, 'length': img.size, 'type': 'texture_ci4', 'uncomp_size': img.size}
+                            yield asset
+                            temp_assets.append(asset)
+                            self.logger.info(f"Found texture (CI4) at offset 0x{i:08x}, size 0x{img.size:08x}")
+                            # Immediate disk flush for textures
+                            with open(self.temp_asset_file, 'a') as f:
+                                json.dump([asset], f)
+                                f.write('\n')
+                            temp_assets = []
                             texture_count += 1
-                            break
-                        except:
-                            i += 128  # Large skip for failed attempts
-                            break
+                            i += img.size
+                            continue
+                    except:
+                        pass
+                    try:
+                        img = CI8(rom[i:i+0x1000], 32, 32)
+                        if 8 <= img.width <= 64 and 8 <= img.height <= 64:
+                            asset = {'offset': i, 'length': img.size, 'type': 'texture_ci8', 'uncomp_size': img.size}
+                            yield asset
+                            temp_assets.append(asset)
+                            self.logger.info(f"Found texture (CI8) at offset 0x{i:08x}, size 0x{img.size:08x}")
+                            with open(self.temp_asset_file, 'a') as f:
+                                json.dump([asset], f)
+                                f.write('\n')
+                            temp_assets = []
+                            texture_count += 1
+                            i += img.size
+                            continue
+                    except:
+                        pass
+                    i += 256
                 self.logger.debug(f"Texture chunk 0x{chunk_start:08x}-0x{chunk_end:08x}, found {texture_count} textures, memory usage: {self.get_memory_usage():.2f} MB")
-                gc.collect()  # Free memory after chunk
+                gc.collect()
+            if temp_assets:
+                with open(self.temp_asset_file, 'a') as f:
+                    json.dump(temp_assets, f)
+                    f.write('\n')
         except Exception as e:
             self.logger.error(f"Texture scanning failed: {str(e)}")
-        self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
-        self.logger.debug("Exiting find_textures")
+        finally:
+            self.logger.info(f"Found {texture_count} textures")
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
+            self.logger.debug("Exiting find_textures")
 
     def extract_texture(self, rom, offset, length, fmt, output_dir):
         self.logger.debug(f"Entering extract_texture: offset=0x{offset:08x}, fmt={fmt}")
@@ -263,12 +366,14 @@ class RomAnalyzer:
         finally:
             self.logger.debug("Exiting extract_texture")
 
+    @profile
     def find_audio(self, rom, progress_callback=None):
         self.logger.debug("Entering find_audio")
         potential_count = {'ctl': 0, 'seq': 0, 'tbl': 0, 'vadpcm': 0}
         invalid_count = {'ctl': 0, 'seq': 0, 'tbl': 0, 'vadpcm': 0}
-        start_offset = int(self.rom_size * 0.75)  # Last 25% of ROM
+        start_offset = int(self.rom_size * 0.8)  # Last 20% of ROM
         i = start_offset
+        temp_assets = []
         try:
             while i < len(rom) - 16:
                 if not self.check_resources():
@@ -278,48 +383,70 @@ class RomAnalyzer:
                                      f"Scanning Audio: CTL={potential_count['ctl']}, SEQ={potential_count['seq']}, TBL={potential_count['tbl']}, VADPCM={potential_count['vadpcm']}")
                 if rom[i:i+4] in [b'\x42\x4E\x4B\x20', b'\x53\x45\x51\x20']:
                     asset_type = 'ctl' if rom[i:i+4] == b'\x42\x4E\x4B\x20' else 'seq'
-                    if potential_count[asset_type] < 10:
-                        self.logger.info(f"Potential {asset_type.upper()} at 0x{i:08x}")
                     potential_count[asset_type] += 1
+                    if potential_count[asset_type] < 5:
+                        self.logger.info(f"Potential {asset_type.upper()} at 0x{i:08x}")
                     length = 0
                     if asset_type == 'seq' and i + 8 <= len(rom):
                         length = struct.unpack('>I', rom[i+4:i+8])[0]
                         if length > len(rom) - i or length > 0x100000:
-                            if invalid_count[asset_type] < 10:
-                                self.logger.warning(f"Invalid SEQ length at 0x{i:08x}: 0x{length:08x}")
                             invalid_count[asset_type] += 1
+                            if invalid_count[asset_type] < 5:
+                                self.logger.warning(f"Invalid SEQ length at 0x{i:08x}: 0x{length:08x}")
                             length = 0
                     elif asset_type == 'ctl' and i + 16 <= len(rom):
                         tbl_offset = struct.unpack('>I', rom[i+12:i+16])[0]
                         if 0 < tbl_offset < len(rom):
-                            yield {'offset': tbl_offset, 'length': 0, 'type': 'tbl', 'uncomp_size': 0}
-                            if potential_count['tbl'] < 10:
-                                self.logger.info(f"Found TBL at offset 0x{tbl_offset:08x}")
+                            asset = {'offset': tbl_offset, 'length': 0, 'type': 'tbl', 'uncomp_size': 0}
+                            yield asset
+                            temp_assets.append(asset)
                             potential_count['tbl'] += 1
-                    yield {'offset': i, 'length': length, 'type': asset_type, 'uncomp_size': length}
+                            if potential_count['tbl'] < 5:
+                                self.logger.info(f"Found TBL at offset 0x{tbl_offset:08x}")
+                    asset = {'offset': i, 'length': length, 'type': asset_type, 'uncomp_size': length}
+                    yield asset
+                    temp_assets.append(asset)
                     self.logger.info(f"Found {asset_type.upper()} at offset 0x{i:08x}, length=0x{length:08x}")
+                    if len(temp_assets) >= 500:
+                        with open(self.temp_asset_file, 'a') as f:
+                            json.dump(temp_assets, f)
+                            f.write('\n')
+                        temp_assets = []
                     i += 4
-                elif i + 9 <= len(rom) and rom[i] & 0xF0 == 0x00:
-                    # Validate VADPCM: flags, predictor index, state
-                    if (i + 27 <= len(rom) and
-                        all(rom[i + j] & 0xF0 == 0x00 for j in (0, 9, 18)) and
-                        rom[i + 1] in [0x00, 0x01, 0x02] and  # Predictor index
-                        all(-128 <= rom[i + j] <= 127 for j in range(2, 9))):  # State values
-                        if potential_count['vadpcm'] < 10:
-                            self.logger.info(f"Potential VADPCM at offset 0x{i:08x}")
+                elif i + 45 <= len(rom) and rom[i] & 0xF0 == 0x00 and i % 9 == 0:  # Frame alignment
+                    valid_frames = all(
+                        rom[i + j] & 0xF0 == 0x00 and
+                        rom[i + j + 1] in [0x00, 0x01, 0x02] and
+                        all(-128 <= rom[i + j + k] <= 127 for k in range(2, 9))
+                        for j in (0, 9, 18, 27, 36)
+                    )
+                    if valid_frames:
                         potential_count['vadpcm'] += 1
-                        yield {'offset': i, 'length': 9, 'type': 'vadpcm', 'uncomp_size': 0}
-                        i += 27
+                        if potential_count['vadpcm'] < 5:
+                            self.logger.info(f"Potential VADPCM at offset 0x{i:08x}")
+                        asset = {'offset': i, 'length': 9, 'type': 'vadpcm', 'uncomp_size': 0}
+                        yield asset
+                        temp_assets.append(asset)
+                        i += 45
+                        if len(temp_assets) >= 500:
+                            with open(self.temp_asset_file, 'a') as f:
+                                json.dump(temp_assets, f)
+                                f.write('\n')
+                            temp_assets = []
                     else:
-                        if invalid_count['vadpcm'] < 10:
-                            self.logger.debug(f"Invalid VADPCM at 0x{i:08x}")
                         invalid_count['vadpcm'] += 1
+                        if invalid_count['vadpcm'] < 5:
+                            self.logger.debug(f"Invalid VADPCM at 0x{i:08x}")
                         i += 4
                 else:
                     i += 4
                 if i % 0x100000 == 0:
                     self.logger.debug(f"Audio scan at 0x{i:08x}, memory usage: {self.get_memory_usage():.2f} MB")
-            # Scan MIO0 blocks for audio
+            if temp_assets:
+                with open(self.temp_asset_file, 'a') as f:
+                    json.dump(temp_assets, f)
+                    f.write('\n')
+            # Scan MIO0 blocks
             for mio0 in self.find_mio0_headers(rom):
                 try:
                     decomp_data = self.decompress_mio0(rom, mio0['offset'], mio0['length'])
@@ -327,31 +454,44 @@ class RomAnalyzer:
                     while j < len(decomp_data) - 16:
                         if decomp_data[j:j+4] in [b'\x42\x4E\x4B\x20', b'\x53\x45\x51\x20']:
                             asset_type = 'ctl' if decomp_data[j:j+4] == b'\x42\x4E\x4B\x20' else 'seq'
-                            if potential_count[asset_type] < 10:
-                                self.logger.info(f"Potential {asset_type.upper()} in MIO0 at ROM offset 0x{mio0['offset']:08x}, MIO0 offset 0x{j:08x}")
                             potential_count[asset_type] += 1
+                            if potential_count[asset_type] < 5:
+                                self.logger.info(f"Potential {asset_type.upper()} in MIO0 at ROM offset 0x{mio0['offset']:08x}, MIO0 offset 0x{j:08x}")
                             length = 0
                             if asset_type == 'seq' and j + 8 <= len(decomp_data):
                                 length = struct.unpack('>I', decomp_data[j+4:j+8])[0]
-                            yield {
+                            asset = {
                                 'offset': mio0['offset'],
                                 'length': length,
                                 'type': f'{asset_type}_mio0',
                                 'uncomp_size': length,
                                 'mio0_offset': j
                             }
+                            yield asset
+                            temp_assets.append(asset)
                             self.logger.info(f"Found {asset_type.upper()} in MIO0 at ROM offset 0x{mio0['offset']:08x}, MIO0 offset 0x{j:08x}")
+                            if len(temp_assets) >= 500:
+                                with open(self.temp_asset_file, 'a') as f:
+                                    json.dump(temp_assets, f)
+                                    f.write('\n')
+                                temp_assets = []
                         j += 4
-                    gc.collect()  # Free memory after MIO0
+                    gc.collect()
                 except Exception as e:
                     self.logger.error(f"Failed to scan MIO0 at 0x{mio0['offset']:08x}: {str(e)}")
-            if invalid_count['vadpcm'] > 10:
-                self.logger.info(f"Skipped {invalid_count['vadpcm'] - 10} additional invalid VADPCM frames")
+            if temp_assets:
+                with open(self.temp_asset_file, 'a') as f:
+                    json.dump(temp_assets, f)
+                    f.write('\n')
+            if invalid_count['vadpcm'] > 5:
+                self.logger.info(f"Skipped {invalid_count['vadpcm'] - 5} additional invalid VADPCM frames")
         except Exception as e:
             self.logger.error(f"Audio scanning failed: {str(e)}")
-        self.logger.info(f"Scanned audio: CTL={potential_count['ctl']}, SEQ={potential_count['seq']}, TBL={potential_count['tbl']}, VADPCM={potential_count['vadpcm']}")
-        self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
-        self.logger.debug("Exiting find_audio")
+        finally:
+            self.logger.info(f"Scanned audio: CTL={potential_count['ctl']}, SEQ={potential_count['seq']}, TBL={potential_count['tbl']}, VADPCM={potential_count['vadpcm']}")
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
+            self.logger.debug("Exiting find_audio")
 
     def extract_audio(self, rom, offset, length, asset_type, output_dir):
         self.logger.debug(f"Entering extract_audio: offset=0x{offset:08x}, type={asset_type}")
@@ -390,7 +530,17 @@ class RomAnalyzer:
             else:
                 segments = [
                     {'start': 0x0, 'end': 0x1000, 'type': 'header', 'name': 'header'},
-                    {'start': 0x1000, 'end': self.rom_size // 2, 'type': 'code', 'name': 'code'},
+                    {
+                        'start': 0x1000,
+                        'end': self.rom_size // 2,
+                        'type': 'code',
+                        'name': 'code',
+                        'subsegments': [
+                            {'start': 0x1000, 'end': self.rom_size // 4, 'type': '.text', 'name': 'text'},
+                            {'start': self.rom_size // 4, 'end': self.rom_size // 3, 'type': '.data', 'name': 'data'},
+                            {'start': self.rom_size // 3, 'end': self.rom_size // 2, 'type': '.bss', 'name': 'bss'}
+                        ]
+                    },
                     {'start': self.rom_size // 2, 'end': self.rom_size * 3 // 4, 'type': 'data', 'name': 'data'},
                     {'start': self.rom_size * 3 // 4, 'end': self.rom_size, 'type': 'assets', 'name': 'assets'}
                 ]
@@ -400,6 +550,7 @@ class RomAnalyzer:
             self.logger.error(f"Failed to get dynamic segments: {str(e)}")
             raise
 
+    @profile
     def run_splat(self, rom_path, output_dir):
         self.logger.debug(f"Entering run_splat: rom_path={rom_path}, output_dir={output_dir}")
         try:
@@ -407,6 +558,10 @@ class RomAnalyzer:
             target_path = os.path.join(output_dir, 'rom.z64')
             os.makedirs(output_dir, exist_ok=True)
             shutil.copy(rom_path, target_path)
+            with open(rom_path, 'rb') as f1, open(target_path, 'rb') as f2:
+                if f1.read() != f2.read():
+                    self.logger.error("ROM copy verification failed")
+                    return
             config = {
                 'options': {
                     'platform': 'n64',
@@ -421,27 +576,53 @@ class RomAnalyzer:
                 'baserom': os.path.basename(rom_path),
                 'segments': self.get_dynamic_segments()
             }
+            # Validate YAML
+            if not config['segments'] or not any('subsegments' in seg for seg in config['segments'] if seg['type'] == 'code'):
+                self.logger.error("Invalid splat.yaml: No subsegments in code segment")
+                return
             with open(splat_yaml, 'w') as f:
                 yaml.dump(config, f)
             self.logger.info(f"Running n64splat on {rom_path}")
-            subprocess.run(['splat', 'split', splat_yaml, '--verbose'], check=True, cwd=output_dir)
+            for attempt in range(2):
+                try:
+                    result = subprocess.run(['splat', 'split', splat_yaml, '--verbose'], check=True, cwd=output_dir, capture_output=True, text=True)
+                    self.logger.debug(f"splat output: {result.stdout}")
+                    break
+                except subprocess.CalledProcessError as e:
+                    self.logger.error(f"n64splat attempt {attempt+1} failed: {e.stderr}")
+                    if attempt == 1:
+                        raise
             self.logger.info(f"n64splat completed, output in {output_dir}")
             splat_config_path = os.path.join(output_dir, 'assets', 'config.yaml')
             if os.path.exists(splat_config_path):
                 with open(splat_config_path, 'r') as f:
                     splat_config = yaml.safe_load(f)
+                temp_assets = []
                 for asset in splat_config.get('assets', []):
-                    yield {
+                    asset_data = {
                         'offset': int(asset['offset'], 16) if isinstance(asset['offset'], str) else asset['offset'],
                         'length': asset.get('length', 0),
                         'type': asset.get('type', 'unknown'),
                         'uncomp_size': asset.get('uncomp_size', 0)
                     }
+                    yield asset_data
+                    temp_assets.append(asset_data)
+                    if len(temp_assets) >= 500:
+                        with open(self.temp_asset_file, 'a') as f:
+                            json.dump(temp_assets, f)
+                            f.write('\n')
+                        temp_assets = []
+                if temp_assets:
+                    with open(self.temp_asset_file, 'a') as f:
+                        json.dump(temp_assets, f)
+                        f.write('\n')
             else:
                 self.logger.warning("No splat config found")
         except Exception as e:
             self.logger.error(f"n64splat failed: {str(e)}")
         finally:
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
             self.logger.debug("Exiting run_splat")
 
     def write_yaml(self, rom_path, assets_iter, output_dir='.'):
@@ -465,16 +646,18 @@ class RomAnalyzer:
                         'length': f'0x{asset["length"]:08x}' if asset['length'] else 'unknown',
                         'uncomp_size': f'0x{asset["uncomp_size"]:08x}' if asset.get('uncomp_size') else 'unknown'
                     })
-                    if len(config['assets']) % 1000 == 0:
+                    if len(config['assets']) >= 500:
                         yaml.dump(config, f, sort_keys=False)
-                        config['assets'] = []  # Reset to save memory
+                        config['assets'] = []
                         self.logger.debug(f"Flushed {len(config['assets'])} assets to YAML")
-                if config['assets']:  # Write remaining assets
+                if config['assets']:
                     yaml.dump(config, f, sort_keys=False)
             self.logger.info(f"Wrote YAML to {yaml_path}")
         except Exception as e:
             self.logger.error(f"Failed to write YAML: {str(e)}")
         finally:
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
             self.logger.debug("Exiting write_yaml")
 
     def write_offset_pairs(self, assets_iter, output_dir='.'):
@@ -486,10 +669,14 @@ class RomAnalyzer:
                 for asset in assets_iter:
                     if asset['length']:
                         f.write(f'0x{asset["offset"]:08x},0x{asset["offset"] + asset["length"]:08x}\n')
+                    if f.tell() % (500 * 1024) == 0:  # Flush every 500KB
+                        f.flush()
             self.logger.info(f"Wrote offset pairs to {offset_path}")
         except Exception as e:
             self.logger.error(f"Failed to write offset pairs: {str(e)}")
         finally:
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
             self.logger.debug("Exiting write_offset_pairs")
 
     def write_summary(self, assets_iter, output_dir):
@@ -505,9 +692,9 @@ class RomAnalyzer:
                     total_assets += 1
                     types[asset['type']] = types.get(asset['type'], 0) + 1
                     f.write(f"{asset['type'].upper()} at Offset: 0x{asset['offset']:08x}, Length: {f'0x{asset['length']:08x}' if asset['length'] else 'unknown'}\n")
-                    if total_assets % 1000 == 0:
+                    if total_assets % 500 == 0:
                         f.write(f"\nIntermediate Total: {total_assets} assets\n")
-                        f.flush()  # Save progress
+                        f.flush()
                 f.write(f"\nTotal Assets: {total_assets}\n")
                 f.write("\nAsset Type Counts:\n")
                 for t, count in types.items():
@@ -516,8 +703,11 @@ class RomAnalyzer:
         except Exception as e:
             self.logger.error(f"Failed to write summary: {str(e)}")
         finally:
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
             self.logger.debug("Exiting write_summary")
 
+    @profile
     def analyze_all(self, rom, options, progress_callback=None, cancel_event=None):
         self.logger.debug("Entering analyze_all")
         def combine_assets():
@@ -546,5 +736,7 @@ class RomAnalyzer:
             self.logger.error(f"Memory error during analysis: {str(e)}")
         except Exception as e:
             self.logger.error(f"Concurrent analysis failed: {str(e)}")
-        self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB")
-        self.logger.debug("Exiting analyze_all")
+        finally:
+            self.logger.debug(f"Memory usage: {self.get_memory_usage():.2f} MB, Peak: {self.peak_memory:.2f} MB")
+            gc.collect()
+            self.logger.debug("Exiting analyze_all")

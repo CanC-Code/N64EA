@@ -1,0 +1,10 @@
+# N64EA logs and temporary files
+src/n64ea.log
+src/temp_assets.json
+
+# Python cache directories
+__pycache__/
+*.pyc
+
+# Virtual environment (if present in the repo)
+n64ea_venv/

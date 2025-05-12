@@ -11,9 +11,17 @@ import threading
 import time
 from datetime import datetime
 import psutil
+import json
 
 # Configure logging with timestamps
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('n64ea.log'),
+        logging.StreamHandler()
+    ]
+)
 
 class MainWindow(tk.Tk):
     def __init__(self):
@@ -26,6 +34,8 @@ class MainWindow(tk.Tk):
         self.cancel_event = None
         self.pause_event = None
         self.analyzer = RomAnalyzer()
+        self.asset_counts = {'mio0': 0, 'yaz0': 0, 'texture_ci4': 0, 'texture_ci8': 0, 'ctl': 0, 'seq': 0, 'tbl': 0, 'vadpcm': 0, 'ctl_mio0': 0, 'seq_mio0': 0}
+        self.start_time = None
 
         # ROM selection
         self.rom_path = tk.StringVar(value="No ROM selected")
@@ -61,8 +71,10 @@ class MainWindow(tk.Tk):
         self.progress.pack(fill="x", padx=10, pady=5)
         self.progress_label = tk.StringVar(value="Progress: 0%")
         tk.Label(self, textvariable=self.progress_label).pack(pady=5)
-        self.resource_label = tk.StringVar(value="Memory: 0 MB, CPU: 0%")
+        self.resource_label = tk.StringVar(value="Memory: 0 MB, CPU: 0%, Peak: 0 MB")
         tk.Label(self, textvariable=self.resource_label).pack(pady=5)
+        self.time_label = tk.StringVar(value="Time Remaining: Unknown")
+        tk.Label(self, textvariable=self.time_label).pack(pady=5)
 
         # Control buttons
         self.run_button = tk.Button(self, text="Run Analysis", command=self.run_analysis)
@@ -124,10 +136,16 @@ class MainWindow(tk.Tk):
             try:
                 self.progress['value'] = min(value, 100)
                 self.progress_label.set(f"Progress: {int(value)}%")
-                self.status_var.set(step)
+                counts_str = ', '.join(f"{k.upper()}: {v}" for k, v in self.asset_counts.items() if v > 0)
+                self.status_var.set(f"{step} ({counts_str})")
                 mem_usage = self.analyzer.get_memory_usage()
                 cpu_usage = self.analyzer.get_cpu_usage()
-                self.resource_label.set(f"Memory: {mem_usage:.2f} MB, CPU: {cpu_usage:.1f}%")
+                peak_memory = self.analyzer.peak_memory
+                self.resource_label.set(f"Memory: {mem_usage:.2f} MB, CPU: {cpu_usage:.1f}%, Peak: {peak_memory:.2f} MB")
+                if self.start_time and value > 0:
+                    elapsed = time.time() - self.start_time
+                    remaining = (elapsed / value) * (100 - value)
+                    self.time_label.set(f"Time Remaining: {int(remaining)}s")
                 self.update_idletasks()
             except Exception as e:
                 self.logger.error(f"Failed to update progress: {str(e)}")
@@ -177,10 +195,15 @@ class MainWindow(tk.Tk):
             self.cancel_button.config(state=tk.NORMAL)
             self.cancel_event = threading.Event()
             self.pause_event = threading.Event()
+            self.asset_counts = {k: 0 for k in self.asset_counts}
+            self.start_time = time.time()
             self.progress['value'] = 0
             self.progress_label.set("Progress: 0%")
-            self.resource_label.set("Memory: 0 MB, CPU: 0%")
+            self.resource_label.set("Memory: 0 MB, CPU: 0%, Peak: 0 MB")
+            self.time_label.set("Time Remaining: Unknown")
             self.status_var.set("Starting analysis")
+            if os.path.exists(self.analyzer.temp_asset_file):
+                os.remove(self.analyzer.temp_asset_file)
             threading.Thread(target=self._analyze_thread, daemon=True).start()
         except Exception as e:
             self.log_message(f"Error starting analysis: {str(e)}")
@@ -190,7 +213,6 @@ class MainWindow(tk.Tk):
     def _analyze_thread(self):
         self.logger.debug("Entering _analyze_thread")
         try:
-            start_time = time.time()
             self.log_message(f"Analyzing {self.rom_path.get()}...")
             self.update_progress(0, "Loading ROM")
             rom = self.analyzer.load_rom(self.rom_path.get())
@@ -210,6 +232,7 @@ class MainWindow(tk.Tk):
                         self.log_message("Paused: Waiting to resume...")
                         self.pause_event.wait()
                     assets.append(asset)
+                    self.asset_counts[asset['type']] = self.asset_counts.get(asset['type'], 0) + 1
             options = {
                 'mio0': self.mio0_var.get(),
                 'yaz0': self.yaz0_var.get(),
@@ -228,6 +251,15 @@ class MainWindow(tk.Tk):
                         self.log_message("Paused: Waiting to resume...")
                         self.pause_event.wait()
                     assets.append(asset)
+                    self.asset_counts[asset['type']] = self.asset_counts.get(asset['type'], 0) + 1
+            # Load temp assets
+            if os.path.exists(self.analyzer.temp_asset_file):
+                with open(self.analyzer.temp_asset_file, 'r') as f:
+                    for line in f:
+                        temp_assets = json.loads(line.strip())
+                        for asset in temp_assets:
+                            assets.append(asset)
+                            self.asset_counts[asset['type']] = self.asset_counts.get(asset['type'], 0) + 1
             if self.textures_var.get() and not self.cancel_event.is_set():
                 if self.pause_event.is_set():
                     self.log_message("Paused: Waiting to resume...")
@@ -273,7 +305,7 @@ class MainWindow(tk.Tk):
                 self.analyzer.write_summary(assets, self.output_dir.get())
                 self.log_message(f"Generated {os.path.join(self.output_dir.get(), 'summary.txt')}")
             self.update_progress(100, "Analysis complete")
-            elapsed = time.time() - start_time
+            elapsed = time.time() - self.start_time
             self.log_message(f"Analysis completed in {elapsed:.2f} seconds")
         except Exception as e:
             self.log_message(f"Error: {str(e)}")
@@ -284,4 +316,8 @@ class MainWindow(tk.Tk):
             self.cancel_button.config(state=tk.DISABLED)
             self.cancel_event = None
             self.pause_event = None
+            self.start_time = None
+            if os.path.exists(self.analyzer.temp_asset_file):
+                os.remove(self.analyzer.temp_asset_file)
+            self.logger.debug(f"Memory usage: {self.analyzer.get_memory_usage():.2f} MB, Peak: {self.analyzer.peak_memory:.2f} MB")
             self.logger.debug("Exiting _analyze_thread")
