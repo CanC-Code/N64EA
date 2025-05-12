@@ -1,6 +1,7 @@
 import yaml
 import os
 import struct
+import psutil
 
 class RomAnalyzer:
     def __init__(self, rom_path, output_folder, symbols_path=None):
@@ -11,6 +12,8 @@ class RomAnalyzer:
         self.segments = []
         self.offsets = []
         self.config = {}
+        self.assets = []  # To store detected assets
+        self.peak_memory = 0
 
         # Check if rom_info.yaml exists in the output folder
         rom_info_path = os.path.join(self.output_folder, "rom_info.yaml")
@@ -45,6 +48,16 @@ class RomAnalyzer:
             # Save the analyzed data to rom_info.yaml
             self.save_rom_info()
 
+    def get_memory_usage(self):
+        """Return current memory usage in MB."""
+        mem = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
+        self.peak_memory = max(self.peak_memory, mem)
+        return mem
+
+    def get_cpu_usage(self):
+        """Return current CPU usage percentage."""
+        return psutil.cpu_percent(interval=None)
+
     def extract_rom_info(self):
         """Extract ROM name and header information from the ROM."""
         # Extract ROM name from the file path
@@ -74,9 +87,9 @@ class RomAnalyzer:
 
         # 2. Use entry point from header to find start of code
         entry_point = self.config["header"]["entry_point"]
-        entry_point_offset = entry_point - 0x80000000  # Adjust for N64 base address
+        entry_point_offset = entry_point - 0x80000000
         if entry_point_offset < 0x40 or entry_point_offset >= len(self.rom_data):
-            entry_point_offset = 0x40  # Fallback to after header if invalid
+            entry_point_offset = 0x40
 
         # Code segment starts after the header (or at entry point)
         code_start = max(0x40, entry_point_offset)
@@ -85,15 +98,13 @@ class RomAnalyzer:
         # 3. Scan for data and assets using known compression formats (MIO0, Yaz0)
         pos = code_start
         while pos < len(self.rom_data) - 4:
-            # Check for MIO0 (common compression format in N64 ROMs)
             if self.rom_data[pos:pos+4] == b"MIO0":
-                if self.segments[-1][1] is None:  # Close the code segment
+                if self.segments[-1][1] is None:
                     self.segments[-1][1] = pos
                 self.segments.append([pos, None, "assets"])
                 break
-            # Check for Yaz0 (another common compression format)
             elif self.rom_data[pos:pos+4] == b"Yaz0":
-                if self.segments[-1][1] is None:  # Close the code segment
+                if self.segments[-1][1] is None:
                     self.segments[-1][1] = pos
                 self.segments.append([pos, None, "assets"])
                 break
@@ -106,7 +117,6 @@ class RomAnalyzer:
             if code_end < assets_start:
                 self.segments.insert(2, [code_end, assets_start, "data"])
         else:
-            # If no assets found, assume data extends to the end of the ROM
             if self.segments[-1][1] is None:
                 self.segments[-1][1] = len(self.rom_data)
 
@@ -118,86 +128,115 @@ class RomAnalyzer:
 
     def detect_offsets(self):
         """Dynamically detect offsets for assets (e.g., textures, audio)."""
+        self.offsets = []
+        self.assets = []
         pos = 0
-        while pos < len(self.rom_data) - 16:  # Ensure enough bytes for pattern matching
-            # Detect CI4/CI8 textures (simplified check for texture headers)
-            # N64 textures often have a header with width/height/format
-            # Check for plausible texture format identifiers
+        while pos < len(self.rom_data) - 16:
+            # Detect MIO0
+            if pos + 4 < len(self.rom_data) and self.rom_data[pos:pos+4] == b"MIO0":
+                self.offsets.append(pos)
+                self.assets.append({"type": "mio0", "offset": pos, "length": None})
+                pos += 0x1000  # Skip a block
+                continue
+
+            # Detect Yaz0
+            if pos + 4 < len(self.rom_data) and self.rom_data[pos:pos+4] == b"Yaz0":
+                self.offsets.append(pos)
+                self.assets.append({"type": "yaz0", "offset": pos, "length": None})
+                pos += 0x1000
+                continue
+
+            # Detect CI4/CI8 textures
             if pos + 4 < len(self.rom_data):
-                # Look for texture format bytes (simplified, based on common N64 texture formats)
-                # CI4 and CI8 textures often have specific byte patterns in tools like n64split
-                # Here, we check for a plausible width/height (2 bytes each) followed by data
                 width = struct.unpack(">H", self.rom_data[pos:pos+2])[0]
                 height = struct.unpack(">H", self.rom_data[pos+2:pos+4])[0]
-                # Check if width and height are reasonable (e.g., between 1 and 1024)
                 if 1 <= width <= 1024 and 1 <= height <= 1024:
-                    # Check for texture data following the header (simplified heuristic)
-                    # CI4 uses 4 bits per pixel, CI8 uses 8 bits per pixel
-                    expected_size_ci4 = (width * height) // 2  # 4 bits per pixel
-                    expected_size_ci8 = width * height         # 8 bits per pixel
+                    expected_size_ci4 = (width * height) // 2
+                    expected_size_ci8 = width * height
                     if pos + 4 + expected_size_ci4 < len(self.rom_data):
                         self.offsets.append(pos)
+                        self.assets.append({"type": "texture_ci4", "offset": pos, "length": expected_size_ci4 + 4})
                         pos += 4 + expected_size_ci4
                         continue
                     elif pos + 4 + expected_size_ci8 < len(self.rom_data):
                         self.offsets.append(pos)
+                        self.assets.append({"type": "texture_ci8", "offset": pos, "length": expected_size_ci8 + 4})
                         pos += 4 + expected_size_ci8
                         continue
 
             # Detect VADPCM audio
-            # VADPCM audio in N64 ROMs often starts with a header indicating predictors
-            # Look for a pattern that might indicate VADPCM audio (simplified)
-            # VADPCM headers typically have a predictor count and coefficients
             if pos + 16 < len(self.rom_data):
-                # Check for a plausible VADPCM header
-                # Predictor count (2 bytes) followed by coefficients (simplified check)
                 predictor_count = struct.unpack(">H", self.rom_data[pos:pos+2])[0]
-                if 1 <= predictor_count <= 16:  # Reasonable range for VADPCM predictors
-                    # Assume this is a VADPCM block (further validation needed in practice)
+                if 1 <= predictor_count <= 16:
                     self.offsets.append(pos)
-                    # Skip a reasonable block size (e.g., 0x1000 bytes, adjust as needed)
+                    self.assets.append({"type": "vadpcm", "offset": pos, "length": None})
                     pos += 0x1000
                     continue
 
-            pos += 4  # Increment by 4 bytes to align with typical data boundaries
+            pos += 4
 
         print("Detected offsets:", [hex(offset) for offset in self.offsets])
 
     def save_rom_info(self):
         """Save the detected segments and offsets to rom_info.yaml in the output folder."""
-        # Update the config with detected data
         self.config["segments"] = self.segments
         self.config["offsets"] = [hex(offset) for offset in self.offsets]
 
-        # Ensure the output folder exists
         os.makedirs(self.output_folder, exist_ok=True)
-
-        # Save to rom_info.yaml in the output folder
         output_path = os.path.join(self.output_folder, "rom_info.yaml")
         with open(output_path, "w") as f:
             yaml.dump(self.config, f)
 
         print(f"Saved ROM info to {output_path}")
 
+    def extract_texture(self, rom_data, offset, length, fmt, output_dir):
+        """Extract a texture and save it as a raw binary file (placeholder for PNG conversion)."""
+        if length is None or offset + length > len(rom_data):
+            length = min(0x1000, len(rom_data) - offset)  # Default size if unknown
+        texture_data = rom_data[offset:offset+length]
+        output_path = os.path.join(output_dir, f"texture_{fmt}_{hex(offset)}.bin")
+        with open(output_path, "wb") as f:
+            f.write(texture_data)
+        return output_path
+
+    def extract_audio(self, rom_data, offset, length, audio_type, output_dir):
+        """Extract an audio asset and save it as a raw binary file."""
+        if length is None or offset + length > len(rom_data):
+            length = min(0x1000, len(rom_data) - offset)
+        audio_data = rom_data[offset:offset+length]
+        output_path = os.path.join(output_dir, f"audio_{audio_type}_{hex(offset)}.bin")
+        with open(output_path, "wb") as f:
+            f.write(audio_data)
+        return output_path
+
     def extract_assets(self):
-        """Extract assets using detected segments and offsets."""
+        """Extract assets using detected segments and offsets, returning asset info."""
+        # Extract segments
         for start, end, seg_type in self.segments:
             print(f"Processing segment {seg_type}: {hex(start)}-{hex(end)}")
-            # Placeholder for actual extraction logic
-            # Example: Extract header
             if seg_type == "header":
                 header_data = self.rom_data[start:end]
                 output_file = os.path.join(self.output_folder, "header.bin")
                 with open(output_file, "wb") as f:
                     f.write(header_data)
 
-        for offset in self.offsets:
-            print(f"Extracting asset at offset {hex(offset)}")
-            # Placeholder for actual asset extraction
-            # Example: Extract a small chunk of data at each offset
-            chunk_size = 0x1000  # Example size, adjust as needed
-            if offset + chunk_size <= len(self.rom_data):
-                asset_data = self.rom_data[offset:offset+chunk_size]
-                output_file = os.path.join(self.output_folder, f"asset_{hex(offset)}.bin")
+        # Extract assets based on detected offsets
+        for asset in self.assets:
+            asset_type = asset["type"]
+            offset = asset["offset"]
+            length = asset.get("length")
+            if asset_type.startswith("texture_"):
+                fmt = asset_type.split("_")[-1]
+                self.extract_texture(self.rom_data, offset, length, fmt, self.output_folder)
+            elif asset_type in ["vadpcm", "ctl", "seq", "tbl", "ctl_mio0", "seq_mio0"]:
+                self.extract_audio(self.rom_data, offset, length, asset_type, self.output_folder)
+            elif asset_type in ["mio0", "yaz0"]:
+                # Extract compressed data as raw binary (placeholder for decompression)
+                if length is None or offset + length > len(self.rom_data):
+                    length = min(0x1000, len(self.rom_data) - offset)
+                data = self.rom_data[offset:offset+length]
+                output_file = os.path.join(self.output_folder, f"{asset_type}_{hex(offset)}.bin")
                 with open(output_file, "wb") as f:
-                    f.write(asset_data)
+                    f.write(data)
+
+        return self.assets
