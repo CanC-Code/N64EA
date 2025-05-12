@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime
 import psutil
+import json
 
 # Configure logging with timestamps
 logging.basicConfig(
@@ -136,7 +137,6 @@ class MainWindow(tk.Tk):
                 self.progress_label.set(f"Progress: {int(value)}%")
                 counts_str = ', '.join(f"{k.upper()}: {v}" for k, v in self.asset_counts.items() if v > 0)
                 self.status_var.set(f"{step} ({counts_str})")
-                # Use psutil directly since RomAnalyzer methods are not implemented
                 mem_usage = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
                 cpu_usage = psutil.cpu_percent(interval=None)
                 peak_memory = mem_usage  # Simplified, no peak tracking yet
@@ -201,7 +201,6 @@ class MainWindow(tk.Tk):
             self.resource_label.set("Memory: 0 MB, CPU: 0%, Peak: 0 MB")
             self.time_label.set("Time Remaining: Unknown")
             self.status_var.set("Starting analysis")
-            # Removed references to temp_asset_file since it's not implemented
             threading.Thread(target=self._analyze_thread, daemon=True).start()
         except Exception as e:
             self.log_message(f"Error starting analysis: {str(e)}")
@@ -210,24 +209,44 @@ class MainWindow(tk.Tk):
 
     def _analyze_thread(self):
         self.logger.debug("Entering _analyze_thread")
+        analyzer = None  # Initialize analyzer to None
         try:
             self.log_message(f"Analyzing {self.rom_path.get()}...")
             self.update_progress(0, "Initializing analysis")
 
-            # Create RomAnalyzer instance now that we have rom_path and output_dir
+            # Create RomAnalyzer instance
             analyzer = RomAnalyzer(self.rom_path.get(), self.output_dir.get())
 
-            # Simplified analysis using existing extract_assets method
-            self.update_progress(20, "Extracting assets")
-            analyzer.extract_assets()
+            # Remove temp_assets.json if it exists
+            if os.path.exists(analyzer.temp_asset_file):
+                os.remove(analyzer.temp_asset_file)
 
-            # Update asset counts (simplified, since extract_assets doesn't return assets yet)
-            # We'll need to modify RomAnalyzer to return asset info in the future
-            self.asset_counts = {
-                'texture_ci4': len([offset for offset in analyzer.offsets if "CI4" in str(analyzer.rom_data[offset:offset+4]).upper()]),
-                'texture_ci8': len([offset for offset in analyzer.offsets if "CI8" in str(analyzer.rom_data[offset:offset+4]).upper()]),
-                'vadpcm': len([offset for offset in analyzer.offsets if "VADPCM" in str(analyzer.rom_data[offset:offset+4]).upper()]),
-            }
+            # Detect and extract assets
+            self.update_progress(20, "Detecting assets")
+            analyzer.detect_offsets()  # Ensure assets are detected and saved to temp_assets.json
+
+            # Load assets from temp_assets.json
+            assets = []
+            if os.path.exists(analyzer.temp_asset_file):
+                with open(analyzer.temp_asset_file, 'r') as f:
+                    for line in f:
+                        temp_assets = json.loads(line.strip())
+                        assets.extend(temp_assets)
+                        for asset in temp_assets:
+                            self.asset_counts[asset['type']] = self.asset_counts.get(asset['type'], 0) + 1
+
+            if self.cancel_event.is_set():
+                self.log_message("Analysis cancelled")
+                self.update_progress(0, "Analysis cancelled")
+                return
+
+            if self.pause_event.is_set():
+                self.log_message("Paused: Waiting to resume...")
+                self.pause_event.wait()
+
+            # Extract assets
+            self.update_progress(50, "Extracting assets")
+            analyzer.extract_assets()
 
             if self.cancel_event.is_set():
                 self.log_message("Analysis cancelled")
@@ -241,6 +260,12 @@ class MainWindow(tk.Tk):
             self.update_progress(100, "Analysis complete")
             elapsed = time.time() - self.start_time
             self.log_message(f"Analysis completed in {elapsed:.2f} seconds")
+            self.log_message(f"Found {len(assets)} assets:")
+            for asset in assets[:100]:
+                msg = f"{asset['type'].upper()} at Offset: 0x{asset['offset']:08x}, Length: {f'0x{asset['length']:08x}' if asset['length'] else 'unknown'}"
+                self.log_message(msg)
+            if len(assets) > 100:
+                self.log_message(f"...and {len(assets) - 100} more assets")
         except Exception as e:
             self.log_message(f"Error: {str(e)}")
             self.update_progress(0, "Analysis failed")
@@ -251,4 +276,7 @@ class MainWindow(tk.Tk):
             self.cancel_event = None
             self.pause_event = None
             self.start_time = None
+            # Only access analyzer.temp_asset_file if analyzer is defined
+            if analyzer is not None and os.path.exists(analyzer.temp_asset_file):
+                os.remove(analyzer.temp_asset_file)
             self.logger.debug("Exiting _analyze_thread")
