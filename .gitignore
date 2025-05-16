@@ -8,3 +8,7 @@ __pycache__/
 
 # Virtual environment (if present in the repo)
 n64ea_venv/
+__pycache__/
+*.pyc
+folder structure.txt
+n64ea.log

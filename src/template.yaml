@@ -1,6 +1,8 @@
 rom_name: ""          # To be filled with the ROM filename (without path)
+baserom: ""
 endian: "big"         # Fixed for N64
 arch: "mips"          # Fixed for N64
+platform: "n64"
 header:               # N64 header information
   pi_status: 0        # PI status register (offset 0x00, 4 bytes)
   clock_rate: 0       # Clock rate (offset 0x04, 4 bytes)
